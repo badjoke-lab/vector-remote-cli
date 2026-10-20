@@ -158,6 +158,8 @@ fn create_terminal(
     // Noninteractive script mode keeps the shell process alive but disables
     // zsh's ZLE/prompt and supports sequential command lines on its PTY stdin.
     if shell.ends_with("/zsh") { cmd.arg("-f"); }
+    // +i explicitly turns off auto-interactive mode when stdin is a PTY.
+    cmd.arg("+i");
     cmd.arg("-s");
     cmd.env("PS1", "");
     cmd.env("PROMPT", "");
