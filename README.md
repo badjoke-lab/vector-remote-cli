@@ -6,14 +6,15 @@ Private, owner-only remote shell via encrypted Vector DM. Rust + [Vector SDK](ht
 
 ## Existing Mac installation (one-time move to GitHub updates)
 
-Stop the previous Bot with Ctrl+C, then run **once** in Terminal:
+Stop the previous Bot with Ctrl+C, then paste **once** into Terminal:
 
 ```bash
-git clone https://github.com/badjoke-lab/vector-remote-cli.git "$HOME/.local/share/vector-remote-cli/source"
-bash "$HOME/.local/share/vector-remote-cli/source/scripts/update-and-start.sh"
+git clone https://github.com/badjoke-lab/vector-remote-cli.git "$HOME/.local/share/vector-remote-cli/source" && bash "$HOME/.local/share/vector-remote-cli/source/scripts/setup-mac.sh"
 ```
 
-Thereafter double-click `更新して起動.command` **in that source folder**. Each update fetches from GitHub, builds, and starts the Bot, leaving the existing owner npub and Bot identity untouched.
+After that, double-click **Vector Remote CLI.command** on your Desktop. The launcher fetches updates from GitHub, builds, and starts the Bot, leaving the existing owner npub and Bot identity untouched.
+
+If the folder `$HOME/.local/share/vector-remote-cli/source` already exists, do not delete it or repeat `git clone`; use `bash "$HOME/.local/share/vector-remote-cli/source/scripts/update-and-start.sh"` instead.
 
 The installer does NOT copy or upload your keys. It uses:
 - `~/.config/vector-remote-cli/owner.npub`
