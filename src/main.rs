@@ -25,11 +25,11 @@ const MAX_OUTPUT_MESSAGE_CHARS: usize = 1550;
 const MAX_OUTPUT_MESSAGES_PER_MINUTE: usize = 80;
 const PROCESSED_ID_LIMIT: usize = 20_000;
 
-// Keep one shell process alive for persistent cwd/environment, but do not start
-// a terminal UI: that emits prompts and echoes DM commands back to the user.
-// The PTY remains attached, so Ctrl+C and programs requiring a TTY still work.
-// Commands are evaluated in order in the same shell process.
-const SHELL_DRIVER: &str = "stty -echo || exit 1; trap : INT; while IFS= read -r line; do eval \"$line\"; done";
+// Start the previously proven interactive PTY (not the read/eval loop).
+// The startup handshake switches off PTY echo and zsh's prompt before accepting
+// any commands; a marker prevents startup banners from leaking into the DM.
+const SHELL_READY_MARKER: &str = "__VECTOR_CLI_READY_20261021__";
+const SHELL_INIT: &str = "stty -echo\nPROMPT=''; PS1=''; RPROMPT=''; PROMPT_EOL_MARK=''; printf '__VECTOR_CLI_READY_20261021__\\n'\n";
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -154,8 +154,14 @@ fn create_terminal(
         .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("openpty failed: {e}"))?;
     let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-c");
-    cmd.arg(SHELL_DRIVER);
+    // This interactive mode ran commands successfully before the formatting
+    // regression. Zsh -f skips user prompt plugins/rc files.
+    if shell.ends_with("/zsh") { cmd.arg("-f"); }
+    cmd.arg("-i");
+    cmd.env("PS1", "");
+    cmd.env("PROMPT", "");
+    cmd.env("RPROMPT", "");
+    cmd.env("PROMPT_EOL_MARK", "");
     cmd.env("TERM", "dumb");
     cmd.env("PAGER", "cat");
     cmd.env("GIT_PAGER", "cat");
@@ -167,15 +173,24 @@ fn create_terminal(
         .map_err(|e| format!("cannot write PTY: {e}"))?;
     drop(pair.slave);
 
+    // Bootstrap is written before spawning the command writer. Commands
+    // received immediately after "connect" remain queued in order.
+    writer.write_all(SHELL_INIT.as_bytes())
+        .and_then(|_| writer.flush())
+        .map_err(|e| format!("shell initialization failed: {e}"))?;
     let (control_tx, control_rx) = std_mpsc::channel::<Control>();
     let (out_tx, out_rx) = mpsc::channel::<TerminalEvent>(32);
     let end_tx = out_tx.clone();
     std::thread::spawn(move || {
         while let Ok(control) = control_rx.recv() {
             let ok = match control {
-                Control::WriteLine(line) => writer.write_all(line.as_bytes())
-                    .and_then(|_| writer.write_all(b"\n"))
-                    .and_then(|_| writer.flush()),
+                Control::WriteLine(line) => {
+                    let result = writer.write_all(line.as_bytes())
+                        .and_then(|_| writer.write_all(b"\n"))
+                        .and_then(|_| writer.flush());
+                    eprintln!("[PTY WRITE] command bytes={} ok={}", line.len(), result.is_ok());
+                    result
+                },
                 Control::Interrupt => writer.write_all(b"\x03").and_then(|_| writer.flush()),
                 Control::Terminate => {
                     let _ = writer.write_all(b"\x03exit\n");
@@ -190,16 +205,40 @@ fn create_terminal(
     });
     std::thread::spawn(move || {
         let mut bytes = [0_u8; 4096];
+        let mut startup = Vec::<u8>::new();
+        let mut ready = false;
         loop {
             match reader.read(&mut bytes) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => { eprintln!("[PTY EXIT] EOF"); break; }
+                Err(e) => { eprintln!("[PTY EXIT] read error: {e}"); break; }
                 Ok(n) => {
-                    if out_tx.blocking_send(TerminalEvent::Data(bytes[..n].to_vec())).is_err() {
-                        break;
+                    let data = if !ready {
+                        startup.extend_from_slice(&bytes[..n]);
+                        if let Some(at) = startup.windows(SHELL_READY_MARKER.len())
+                            .position(|x| x == SHELL_READY_MARKER.as_bytes()) {
+                            let mut tail = startup.split_off(at + SHELL_READY_MARKER.len());
+                            if tail.starts_with(b"\r\n") { tail.drain(..2); }
+                            else if tail.starts_with(b"\n") { tail.remove(0); }
+                            startup.clear();
+                            ready = true;
+                            eprintln!("[PTY READY] shell initialization completed");
+                            tail
+                        } else {
+                            if startup.len() > 8192 {
+                                eprintln!("[PTY ERROR] startup exceeded 8KiB without ready marker");
+                                break;
+                            }
+                            continue;
+                        }
+                    } else { bytes[..n].to_vec() };
+                    if !data.is_empty() {
+                        eprintln!("[PTY OUT] bytes={}", data.len());
+                        if out_tx.blocking_send(TerminalEvent::Data(data)).is_err() { break; }
                     }
                 }
             }
         }
+        if !ready { eprintln!("[PTY ERROR] shell never became ready"); }
         let _ = end_tx.blocking_send(TerminalEvent::Exited);
     });
     tokio::spawn(pump_output(bot, owner, generation, sessions, session_id, out_rx));
