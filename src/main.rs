@@ -137,6 +137,15 @@ fn shell_path() -> Result<String, String> {
     Ok(shell)
 }
 
+fn home_dir() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME").ok_or("HOME environment variable is missing")?;
+    let path = PathBuf::from(home);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(format!("invalid home directory: {}", path.display()));
+    }
+    Ok(path)
+}
+
 fn create_terminal(
     bot: VectorBot,
     owner: String,
@@ -149,6 +158,9 @@ fn create_terminal(
     // stdin/stdout are pipes, not a TTY. This eliminates zsh's ZLE command echo
     // and prompts which could not be disabled reliably via portable-pty on macOS.
     let mut cmd = Command::new(&shell);
+    // The updater runs inside the Git repository. Keep the remote shell
+    // independent of that updater working directory.
+    cmd.current_dir(home_dir()?);
     if shell.ends_with("/zsh") { cmd.arg("-f"); }
     cmd.arg("-s");
     cmd.stdin(Stdio::piped());
@@ -480,6 +492,8 @@ mod tests {
     fn persistent_shell_streams_without_echo_or_prompt() {
         let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
         let mut cmd = Command::new(shell);
+        let expected_home = home_dir().expect("valid user HOME");
+        cmd.current_dir(&expected_home);
         if shell.ends_with("/zsh") { cmd.arg("-f"); }
         cmd.arg("-s");
         cmd.stdin(Stdio::piped());
@@ -505,8 +519,11 @@ mod tests {
             }
             panic!("missing expected output {marker}");
         };
-        stdin.write_all(b"printf 'vector-pipe-responded\\n'\n").expect("first write");
+        stdin.write_all(b"pwd\n").expect("first write");
         stdin.flush().expect("first flush");
+        receive(&mut observed, expected_home.to_str().expect("utf8 home directory"));
+        stdin.write_all(b"printf 'vector-pipe-responded\\n'\n").expect("second write");
+        stdin.flush().expect("second flush");
         receive(&mut observed, "vector-pipe-responded");
         stdin.write_all(b"cd /tmp\npwd\n").expect("cwd commands");
         stdin.flush().expect("cwd flush");
