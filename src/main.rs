@@ -2,15 +2,16 @@
 //! Supported targets: macOS / Linux. This is an interactive terminal transported
 //! over messages, not a real-time terminal emulator.
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::{
     collections::{HashSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::{Read, Write},
+    os::unix::process::CommandExt,
+    process::{Command, Stdio},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -24,13 +25,6 @@ const MAX_FUTURE_SKEW_MS: u64 = 30_000;
 const MAX_OUTPUT_MESSAGE_CHARS: usize = 1550;
 const MAX_OUTPUT_MESSAGES_PER_MINUTE: usize = 80;
 const PROCESSED_ID_LIMIT: usize = 20_000;
-
-// Run a persistent native shell over PTY stdin without interactive line editing.
-// Interactive zsh uses ZLE and redisplays commands even with "stty -echo".
-// "zsh -f -s" reads commands incrementally, preserves cd/env and has no prompt.
-// The startup handshake gates DM commands until PTY echo is disabled.
-const SHELL_READY_MARKER: &str = "__VECTOR_CLI_READY_20261021__";
-const SHELL_INIT: &str = "stty -echo\nprintf '%s%s\\n' '__VECTOR_CLI_' 'READY_20261021__'\n";
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -151,111 +145,78 @@ fn create_terminal(
     session_id: u64,
 ) -> Result<ShellSession, String> {
     let shell = shell_path()?;
-    let pair = native_pty_system()
-        .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| format!("openpty failed: {e}"))?;
-    let mut cmd = CommandBuilder::new(&shell);
-    // Noninteractive script mode keeps the shell process alive but disables
-    // zsh's ZLE/prompt and supports sequential command lines on its PTY stdin.
+    // The shell is persistent (cwd, variables, and environment persist), but
+    // stdin/stdout are pipes, not a TTY. This eliminates zsh's ZLE command echo
+    // and prompts which could not be disabled reliably via portable-pty on macOS.
+    let mut cmd = Command::new(&shell);
     if shell.ends_with("/zsh") { cmd.arg("-f"); }
-    // +i explicitly turns off auto-interactive mode when stdin is a PTY.
-    cmd.arg("+i");
     cmd.arg("-s");
-    cmd.env("PS1", "");
-    cmd.env("PROMPT", "");
-    cmd.env("RPROMPT", "");
-    cmd.env("PROMPT_EOL_MARK", "");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     cmd.env("TERM", "dumb");
     cmd.env("PAGER", "cat");
     cmd.env("GIT_PAGER", "cat");
-    let mut child = pair.slave.spawn_command(cmd)
-        .map_err(|e| format!("shell launch failed: {e}"))?;
-    let mut reader = pair.master.try_clone_reader()
-        .map_err(|e| format!("cannot read PTY: {e}"))?;
-    let mut writer = pair.master.take_writer()
-        .map_err(|e| format!("cannot write PTY: {e}"))?;
-    drop(pair.slave);
+    // Isolated child process group permits Ctrl+C without signalling the Bot.
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("shell launch failed: {e}"))?;
+    let mut writer = child.stdin.take().ok_or("cannot acquire shell stdin")?;
+    let stdout = child.stdout.take().ok_or("cannot acquire shell stdout")?;
+    let stderr = child.stderr.take().ok_or("cannot acquire shell stderr")?;
+    let shell_pgid = child.id() as i32;
 
-    // Bootstrap is written before spawning the command writer. Commands
-    // received immediately after "connect" remain queued in order.
-    writer.write_all(SHELL_INIT.as_bytes())
-        .and_then(|_| writer.flush())
-        .map_err(|e| format!("shell initialization failed: {e}"))?;
     let (control_tx, control_rx) = std_mpsc::channel::<Control>();
-    let (ready_tx, ready_rx) = std_mpsc::sync_channel::<bool>(1);
     let (out_tx, out_rx) = mpsc::channel::<TerminalEvent>(32);
-    let end_tx = out_tx.clone();
+    let remaining = Arc::new(AtomicUsize::new(2));
+    for (name, mut reader) in [
+        ("stdout", Box::new(stdout) as Box<dyn Read + Send>),
+        ("stderr", Box::new(stderr) as Box<dyn Read + Send>)
+    ] {
+        let out = out_tx.clone();
+        let rem = remaining.clone();
+        std::thread::spawn(move || {
+            let mut bytes = [0u8; 4096];
+            loop {
+                match reader.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        eprintln!("[SHELL OUT] {name} bytes={n}");
+                        if out.blocking_send(TerminalEvent::Data(bytes[..n].to_vec())).is_err() { break; }
+                    }
+                    Err(e) => { eprintln!("[SHELL READ ERROR] {name}: {e}"); break; }
+                }
+            }
+            if rem.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let _ = out.blocking_send(TerminalEvent::Exited);
+            }
+        });
+    }
+    drop(out_tx);
     std::thread::spawn(move || {
-        // Don't write commands into the PTY until echo and ZLE have been
-        // disabled. This also prevents startup writes being interpreted as
-        // user input before the interactive shell is accepting commands.
-        if ready_rx.recv_timeout(Duration::from_secs(15)).ok() == Some(true) {
-            while let Ok(control) = control_rx.recv() {
-                let ok = match control {
+        while let Ok(control) = control_rx.recv() {
+            let result = match control {
                 Control::WriteLine(line) => {
                     let result = writer.write_all(line.as_bytes())
                         .and_then(|_| writer.write_all(b"\n"))
                         .and_then(|_| writer.flush());
-                    eprintln!("[PTY WRITE] command bytes={} ok={}", line.len(), result.is_ok());
+                    eprintln!("[SHELL WRITE] command bytes={} ok={}", line.len(), result.is_ok());
                     result
-                },
-                Control::Interrupt => writer.write_all(b"\x03").and_then(|_| writer.flush()),
-                Control::Terminate => {
-                    let _ = writer.write_all(b"\x03exit\n");
-                    let _ = writer.flush();
-                    break;
                 }
+                Control::Interrupt => {
+                    if unsafe { libc::kill(-shell_pgid, libc::SIGINT) } == 0 {
+                        Ok(())
+                    } else { Err(std::io::Error::last_os_error()) }
+                }
+                Control::Terminate => break,
             };
-                if ok.is_err() { break; }
-            }
-        } else {
-            eprintln!("[PTY ERROR] shell startup handshake failed or timed out");
+            if let Err(e) = result { eprintln!("[SHELL WRITE ERROR] {e}"); break; }
         }
+        // Stop any child commands in the same isolated process group as well.
+        unsafe { libc::kill(-shell_pgid, libc::SIGTERM); }
         let _ = child.kill();
         let _ = child.wait();
     });
-    std::thread::spawn(move || {
-        let mut bytes = [0_u8; 4096];
-        let mut startup = Vec::<u8>::new();
-        let mut ready = false;
-        loop {
-            match reader.read(&mut bytes) {
-                Ok(0) => { eprintln!("[PTY EXIT] EOF"); break; }
-                Err(e) => { eprintln!("[PTY EXIT] read error: {e}"); break; }
-                Ok(n) => {
-                    let data = if !ready {
-                        startup.extend_from_slice(&bytes[..n]);
-                        if let Some(at) = startup.windows(SHELL_READY_MARKER.len())
-                            .position(|x| x == SHELL_READY_MARKER.as_bytes()) {
-                            let mut tail = startup.split_off(at + SHELL_READY_MARKER.len());
-                            if tail.starts_with(b"\r\n") { tail.drain(..2); }
-                            else if tail.starts_with(b"\n") { tail.remove(0); }
-                            startup.clear();
-                            ready = true;
-                            eprintln!("[PTY READY] shell initialization completed");
-                            let _ = ready_tx.send(true);
-                            tail
-                        } else {
-                            if startup.len() > 8192 {
-                                eprintln!("[PTY ERROR] startup exceeded 8KiB without ready marker");
-                                break;
-                            }
-                            continue;
-                        }
-                    } else { bytes[..n].to_vec() };
-                    if !data.is_empty() {
-                        eprintln!("[PTY OUT] bytes={}", data.len());
-                        if out_tx.blocking_send(TerminalEvent::Data(data)).is_err() { break; }
-                    }
-                }
-            }
-        }
-        if !ready {
-            eprintln!("[PTY ERROR] shell never became ready");
-            let _ = ready_tx.send(false);
-        }
-        let _ = end_tx.blocking_send(TerminalEvent::Exited);
-    });
+    eprintln!("[SHELL READY] persistent piped shell spawned");
     tokio::spawn(pump_output(bot, owner, generation, sessions, session_id, out_rx));
     Ok(ShellSession { tx: control_tx, generation: session_id })
 }
@@ -516,122 +477,48 @@ mod tests {
         assert_eq!((a,b), ("日本", "語"));
     }
     #[test]
-    fn quiet_shell_has_no_prompt_or_command_echo_and_keeps_cwd() {
-        // Exercise the production startup protocol with a permanently open
-        // PTY writer, not the obsolete read/eval driver.
-        let pair = native_pty_system().openpty(PtySize {
-            rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
-        }).expect("open PTY");
+    fn persistent_shell_streams_without_echo_or_prompt() {
         let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = Command::new(shell);
         if shell.ends_with("/zsh") { cmd.arg("-f"); }
         cmd.arg("-s");
-        cmd.env("PS1", "");
-        cmd.env("PROMPT", "");
-        cmd.env("RPROMPT", "");
-        cmd.env("PROMPT_EOL_MARK", "");
-        let mut child = pair.slave.spawn_command(cmd).expect("launch quiet shell");
-        let mut reader = pair.master.try_clone_reader().expect("reader");
-        let mut writer = pair.master.take_writer().expect("writer");
-        drop(pair.slave);
-        writer.write_all(SHELL_INIT.as_bytes()).expect("initialize PTY");
-        writer.flush().expect("flush init");
-        // Wait for the real ready marker before writing more input, as the
-        // production PTY controller now does.
-        let mut output = Vec::new();
-        let mut bytes = [0u8; 2048];
-        while !output.windows(SHELL_READY_MARKER.len())
-            .any(|w| w == SHELL_READY_MARKER.as_bytes()) {
-            let n = reader.read(&mut bytes).expect("read init");
-            assert!(n > 0, "shell stopped before ready handshake");
-            output.extend_from_slice(&bytes[..n]);
-        }
-        writer.write_all(b"pwd\ncd /tmp\npwd\nprintf '100%%\\n'\nexit\n").expect("send");
-        writer.flush().expect("flush commands");
-        drop(writer);
-        drop(pair.master);
-        reader.read_to_end(&mut output).expect("read results");
-        child.wait().expect("shell exit");
-        let output = clean_terminal_output(&output);
-        let marker = output.find(SHELL_READY_MARKER).unwrap_or_else(|| panic!("shell never ready: {output:?}"));
-        let results = &output[marker+SHELL_READY_MARKER.len()..];
-        assert!(!results.contains("pwd"), "unexpected command echo: {results:?}");
-        assert!(!results.contains("lyla@"), "unexpected prompt: {results:?}");
-        assert!(results.contains("/tmp\n"), "cwd did not persist: {results:?}");
-        assert!(results.contains("100%\n"), "legitimate percent output lost: {results:?}");
-    }
-
-    #[test]
-    fn persistent_shell_streams_results_without_closing_writer() {
-        // Regresses the macOS failure: RX handled "pwd" but no PTY data was
-        // returned. Unlike the batch test, no writer EOF or shell exit is
-        // involved before each response must arrive.
-        let pair = native_pty_system().openpty(PtySize {
-            rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
-        }).expect("open PTY");
-        let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
-        let mut cmd = CommandBuilder::new(shell);
-        if shell.ends_with("/zsh") { cmd.arg("-f"); }
-        cmd.arg("-s");
-        cmd.env("PS1", "");
-        cmd.env("PROMPT", "");
-        cmd.env("RPROMPT", "");
-        cmd.env("PROMPT_EOL_MARK", "");
-        let mut child = pair.slave.spawn_command(cmd).expect("launch interactive shell");
-        let mut reader = pair.master.try_clone_reader().expect("reader");
-        let mut writer = pair.master.take_writer().expect("writer");
-        drop(pair.slave);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn shell");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let mut stdout = child.stdout.take().expect("stdout");
         let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
+            while let Ok(n) = stdout.read(&mut buf) {
                 if n == 0 || tx.send(buf[..n].to_vec()).is_err() { break; }
             }
         });
-
-        writer.write_all(SHELL_INIT.as_bytes()).expect("init");
-        writer.flush().expect("flush init");
         let mut observed = String::new();
-        let receive_until = |observed: &mut String, marker: &str| {
+        let receive = |observed: &mut String, marker: &str| {
             for _ in 0..60 {
                 if observed.contains(marker) { return; }
-                let buf = rx.recv_timeout(Duration::from_millis(200))
-                    .expect("shell did not stream output before writer EOF");
-                observed.push_str(&String::from_utf8_lossy(&buf));
+                let data = rx.recv_timeout(Duration::from_millis(200))
+                    .expect("shell failed to respond before stdin EOF");
+                observed.push_str(&String::from_utf8_lossy(&data));
             }
-            panic!("output marker not seen: {marker}");
+            panic!("missing expected output {marker}");
         };
-        receive_until(&mut observed, SHELL_READY_MARKER);
-        let at = observed.find(SHELL_READY_MARKER).expect("ready marker");
-        observed = observed[at + SHELL_READY_MARKER.len()..].to_string();
-
-        writer.write_all(b"printf 'vector-first-reply\\n'\n").expect("first command");
-        writer.flush().expect("first flush");
-        receive_until(&mut observed, "vector-first-reply");
-        writer.write_all(b"cd /tmp\npwd\n").expect("cwd commands");
-        writer.flush().expect("cwd flush");
-        receive_until(&mut observed, "/tmp");
-        assert!(!observed.contains("lyla@"), "interactive prompt leaked");
-        writer.write_all(b"exit\n").expect("exit");
-        writer.flush().expect("exit flush");
+        stdin.write_all(b"printf 'vector-pipe-responded\\n'\n").expect("first write");
+        stdin.flush().expect("first flush");
+        receive(&mut observed, "vector-pipe-responded");
+        stdin.write_all(b"cd /tmp\npwd\n").expect("cwd commands");
+        stdin.flush().expect("cwd flush");
+        receive(&mut observed, "/tmp");
+        stdin.write_all(b"printf '100%%\\n'\n").expect("percent output");
+        stdin.flush().expect("percent flush");
+        receive(&mut observed, "100%");
+        assert!(!observed.contains("cd /tmp"), "command echoed: {observed:?}");
+        assert!(!observed.contains("lyla@"), "prompt emitted: {observed:?}");
+        stdin.write_all(b"exit\n").expect("exit");
+        stdin.flush().expect("exit flush");
         child.wait().expect("wait for shell");
     }
 
-    #[test]
-    fn pty_can_start_local_shell() {
-        let pair = native_pty_system().openpty(PtySize {
-            rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
-        }).expect("open PTY");
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg("printf vector-pty-ok");
-        let mut child = pair.slave.spawn_command(cmd).expect("launch shell");
-        let mut reader = pair.master.try_clone_reader().expect("reader");
-        drop(pair.slave);
-        drop(pair.master);
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).expect("read from PTY");
-        child.wait().expect("wait for shell");
-        assert!(String::from_utf8_lossy(&bytes).contains("vector-pty-ok"));
-    }
 }
