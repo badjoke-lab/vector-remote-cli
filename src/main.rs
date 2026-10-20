@@ -29,7 +29,7 @@ const PROCESSED_ID_LIMIT: usize = 20_000;
 // The startup handshake switches off PTY echo and zsh's prompt before accepting
 // any commands; a marker prevents startup banners from leaking into the DM.
 const SHELL_READY_MARKER: &str = "__VECTOR_CLI_READY_20261021__";
-const SHELL_INIT: &str = "stty -echo\nPROMPT=''; PS1=''; RPROMPT=''; PROMPT_EOL_MARK=''; printf '%s%s\\n' '__VECTOR_CLI_' 'READY_20261021__'\n";
+const SHELL_INIT: &str = "stty -echo\nunsetopt ZLE 2>/dev/null || true; PROMPT=''; PS1=''; RPROMPT=''; PROMPT_EOL_MARK=''; printf '%s%s\\n' '__VECTOR_CLI_' 'READY_20261021__'\n";
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
