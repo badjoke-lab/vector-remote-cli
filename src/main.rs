@@ -478,7 +478,7 @@ mod tests {
         let mut startup = [0u8; 128];
         let n = reader.read(&mut startup).expect("shell ready");
         assert!(String::from_utf8_lossy(&startup[..n]).contains("vector-ready"));
-        writer.write_all(b"pwd\\ncd /tmp\\npwd\\nprintf '100%%\\n'\\nexit\\n").expect("write commands");
+        writer.write_all(b"pwd\ncd /tmp\npwd\nprintf '100%%\\n'\nexit\n").expect("write commands");
         writer.flush().expect("flush commands");
         drop(writer);
         drop(pair.master);
@@ -488,8 +488,8 @@ mod tests {
         let result = clean_terminal_output(&output);
         assert!(!result.contains("pwd"), "unexpected command echo: {result:?}");
         assert!(!result.contains("lyla@"), "unexpected prompt: {result:?}");
-        assert!(result.contains("/tmp\\n"), "cwd did not persist: {result:?}");
-        assert!(result.contains("100%\\n"), "legitimate percent output lost: {result:?}");
+        assert!(result.contains("/tmp\n"), "cwd did not persist: {result:?}");
+        assert!(result.contains("100%\n"), "legitimate percent output lost: {result:?}");
     }
 
     #[test]
