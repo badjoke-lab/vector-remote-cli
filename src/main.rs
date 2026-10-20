@@ -29,7 +29,7 @@ const PROCESSED_ID_LIMIT: usize = 20_000;
 // The startup handshake switches off PTY echo and zsh's prompt before accepting
 // any commands; a marker prevents startup banners from leaking into the DM.
 const SHELL_READY_MARKER: &str = "__VECTOR_CLI_READY_20261021__";
-const SHELL_INIT: &str = "stty -echo\nPROMPT=''; PS1=''; RPROMPT=''; PROMPT_EOL_MARK=''; printf '__VECTOR_CLI_READY_20261021__\\n'\n";
+const SHELL_INIT: &str = "stty -echo\nPROMPT=''; PS1=''; RPROMPT=''; PROMPT_EOL_MARK=''; printf '%s%s\\n' '__VECTOR_CLI_' 'READY_20261021__'\n";
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -502,34 +502,39 @@ mod tests {
     }
     #[test]
     fn quiet_shell_has_no_prompt_or_command_echo_and_keeps_cwd() {
-        // Use a readiness banner to avoid racing PTY initialization in CI.
-        // Production SHELL_DRIVER has no banner and never sends a prompt.
+        // Exercise the production startup protocol with a permanently open
+        // PTY writer, not the obsolete read/eval driver.
         let pair = native_pty_system().openpty(PtySize {
             rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
         }).expect("open PTY");
         let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
         let mut cmd = CommandBuilder::new(shell);
-        cmd.arg("-c");
-        cmd.arg("stty -echo || exit 1; printf 'vector-ready\\n'; while IFS= read -r line; do eval \"$line\"; done");
+        if shell.ends_with("/zsh") { cmd.arg("-f"); }
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        cmd.env("PROMPT", "");
+        cmd.env("RPROMPT", "");
+        cmd.env("PROMPT_EOL_MARK", "");
         let mut child = pair.slave.spawn_command(cmd).expect("launch quiet shell");
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let mut writer = pair.master.take_writer().expect("writer");
         drop(pair.slave);
-        let mut startup = [0u8; 128];
-        let n = reader.read(&mut startup).expect("shell ready");
-        assert!(String::from_utf8_lossy(&startup[..n]).contains("vector-ready"));
-        writer.write_all(b"pwd\ncd /tmp\npwd\nprintf '100%%\\n'\nexit\n").expect("write commands");
+        writer.write_all(SHELL_INIT.as_bytes()).expect("initialize PTY");
+        writer.flush().expect("flush init");
+        writer.write_all(b"pwd\ncd /tmp\npwd\nprintf '100%%\\n'\nexit\n").expect("send");
         writer.flush().expect("flush commands");
         drop(writer);
         drop(pair.master);
         let mut output = Vec::new();
-        reader.read_to_end(&mut output).expect("read shell results");
-        child.wait().expect("wait for shell");
-        let result = clean_terminal_output(&output);
-        assert!(!result.contains("pwd"), "unexpected command echo: {result:?}");
-        assert!(!result.contains("lyla@"), "unexpected prompt: {result:?}");
-        assert!(result.contains("/tmp\n"), "cwd did not persist: {result:?}");
-        assert!(result.contains("100%\n"), "legitimate percent output lost: {result:?}");
+        reader.read_to_end(&mut output).expect("read results");
+        child.wait().expect("shell exit");
+        let output = clean_terminal_output(&output);
+        let marker = output.find(SHELL_READY_MARKER).unwrap_or_else(|| panic!("shell never ready: {output:?}"));
+        let results = &output[marker+SHELL_READY_MARKER.len()..];
+        assert!(!results.contains("pwd"), "unexpected command echo: {results:?}");
+        assert!(!results.contains("lyla@"), "unexpected prompt: {results:?}");
+        assert!(results.contains("/tmp\n"), "cwd did not persist: {results:?}");
+        assert!(results.contains("100%\n"), "legitimate percent output lost: {results:?}");
     }
 
     #[test]
