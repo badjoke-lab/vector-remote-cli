@@ -79,7 +79,6 @@ bootout_if_loaded() {
 }
 bootstrap() {
   launchctl bootstrap "$DOMAIN" "$PLIST"
-  launchctl kickstart -k "$TARGET"
   echo "Bot service enabled for this Mac user (login and automatic restart)."
   echo "The Mac must remain powered on and awake for remote commands."
 }
@@ -109,7 +108,7 @@ case "$MODE" in
       local code=$?
       if [[ -f "$PLIST" ]]; then
         if launchctl bootstrap "$DOMAIN" "$PLIST"; then
-          launchctl kickstart -k "$TARGET" || true
+          echo "Bot service restarted by launchd."
         else
           echo "Unable to restart Bot service; run manage-mac.sh status" >&2
         fi
