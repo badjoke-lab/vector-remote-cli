@@ -2,6 +2,21 @@
 # GitHub-based updater for an existing Mac installation. Never alters Bot keys.
 set -euo pipefail
 
+BUILD_ONLY=false
+if [[ "${1:-}" == "--build-only" ]]; then
+  BUILD_ONLY=true
+elif [[ -n "${1:-}" ]]; then
+  echo "Usage: bash scripts/update-and-start.sh [--build-only]"
+  exit 2
+fi
+
+# Never start a second Bot against the same identity DB if launchd owns it.
+if [[ "$BUILD_ONLY" == false && "$(uname -s)" == "Darwin" ]] &&
+  launchctl print "gui/$(id -u)/com.badjoke-lab.vector-remote-cli" >/dev/null 2>&1; then
+  echo "Bot is managed by launchd. Use scripts/manage-mac.sh update instead."
+  exit 1
+fi
+
 REPO="$HOME/.local/share/vector-remote-cli/source"
 BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/vector-remote-cli"
@@ -55,6 +70,10 @@ if [[ -f "$BIN" ]]; then
   cp "$BIN" "$BIN.previous"
 fi
 mv "$BIN.next" "$BIN"
+if [[ "$BUILD_ONLY" == true ]]; then
+  echo "Build installed; running Bot unchanged. No keys or settings were touched."
+  exit 0
+fi
 
 export VECTOR_OWNER_NPUB
 VECTOR_OWNER_NPUB="$(cat "$OWNER")"
