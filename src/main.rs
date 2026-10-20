@@ -29,7 +29,7 @@ const PROCESSED_ID_LIMIT: usize = 20_000;
 // a terminal UI: that emits prompts and echoes DM commands back to the user.
 // The PTY remains attached, so Ctrl+C and programs requiring a TTY still work.
 // Commands are evaluated in order in the same shell process.
-const SHELL_DRIVER: &str = "stty -echo || exit 1; while IFS= read -r line; do eval \"$line\"; done";
+const SHELL_DRIVER: &str = "stty -echo || exit 1; trap : INT; while IFS= read -r line; do eval \"$line\"; done";
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
