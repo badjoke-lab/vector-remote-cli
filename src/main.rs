@@ -25,11 +25,12 @@ const MAX_OUTPUT_MESSAGE_CHARS: usize = 1550;
 const MAX_OUTPUT_MESSAGES_PER_MINUTE: usize = 80;
 const PROCESSED_ID_LIMIT: usize = 20_000;
 
-// Start the previously proven interactive PTY (not the read/eval loop).
-// The startup handshake switches off PTY echo and zsh's prompt before accepting
-// any commands; a marker prevents startup banners from leaking into the DM.
+// Run a persistent native shell over PTY stdin without interactive line editing.
+// Interactive zsh uses ZLE and redisplays commands even with "stty -echo".
+// "zsh -f -s" reads commands incrementally, preserves cd/env and has no prompt.
+// The startup handshake gates DM commands until PTY echo is disabled.
 const SHELL_READY_MARKER: &str = "__VECTOR_CLI_READY_20261021__";
-const SHELL_INIT: &str = "stty -echo\nunsetopt ZLE 2>/dev/null || true; PROMPT=''; PS1=''; RPROMPT=''; PROMPT_EOL_MARK=''; printf '%s%s\\n' '__VECTOR_CLI_' 'READY_20261021__'\n";
+const SHELL_INIT: &str = "stty -echo\nprintf '%s%s\\n' '__VECTOR_CLI_' 'READY_20261021__'\n";
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -154,10 +155,10 @@ fn create_terminal(
         .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("openpty failed: {e}"))?;
     let mut cmd = CommandBuilder::new(&shell);
-    // This interactive mode ran commands successfully before the formatting
-    // regression. Zsh -f skips user prompt plugins/rc files.
+    // Noninteractive script mode keeps the shell process alive but disables
+    // zsh's ZLE/prompt and supports sequential command lines on its PTY stdin.
     if shell.ends_with("/zsh") { cmd.arg("-f"); }
-    cmd.arg("-i");
+    cmd.arg("-s");
     cmd.env("PS1", "");
     cmd.env("PROMPT", "");
     cmd.env("RPROMPT", "");
@@ -522,7 +523,7 @@ mod tests {
         let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
         let mut cmd = CommandBuilder::new(shell);
         if shell.ends_with("/zsh") { cmd.arg("-f"); }
-        cmd.arg("-i");
+        cmd.arg("-s");
         cmd.env("PS1", "");
         cmd.env("PROMPT", "");
         cmd.env("RPROMPT", "");
@@ -569,7 +570,7 @@ mod tests {
         let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
         let mut cmd = CommandBuilder::new(shell);
         if shell.ends_with("/zsh") { cmd.arg("-f"); }
-        cmd.arg("-i");
+        cmd.arg("-s");
         cmd.env("PS1", "");
         cmd.env("PROMPT", "");
         cmd.env("RPROMPT", "");
