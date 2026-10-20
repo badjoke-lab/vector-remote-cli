@@ -1,0 +1,15 @@
+[package]
+name = "vector-remote-cli"
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+description = "Owner-only persistent terminal over Vector encrypted DMs"
+
+[dependencies]
+vector_sdk = { package = "vector_sdk", git = "https://github.com/VectorPrivacy/Vector", rev = "20efc172693c3556a7d9b61715effc306536f46a" }
+tokio = { version = "1.49", features = ["full"] }
+portable-pty = "0.9"
+
+[features]
+default = []
+tor = ["vector_sdk/tor"]
