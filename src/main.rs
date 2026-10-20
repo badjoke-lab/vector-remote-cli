@@ -179,11 +179,16 @@ fn create_terminal(
         .and_then(|_| writer.flush())
         .map_err(|e| format!("shell initialization failed: {e}"))?;
     let (control_tx, control_rx) = std_mpsc::channel::<Control>();
+    let (ready_tx, ready_rx) = std_mpsc::sync_channel::<bool>(1);
     let (out_tx, out_rx) = mpsc::channel::<TerminalEvent>(32);
     let end_tx = out_tx.clone();
     std::thread::spawn(move || {
-        while let Ok(control) = control_rx.recv() {
-            let ok = match control {
+        // Don't write commands into the PTY until echo and ZLE have been
+        // disabled. This also prevents startup writes being interpreted as
+        // user input before the interactive shell is accepting commands.
+        if ready_rx.recv_timeout(Duration::from_secs(15)).ok() == Some(true) {
+            while let Ok(control) = control_rx.recv() {
+                let ok = match control {
                 Control::WriteLine(line) => {
                     let result = writer.write_all(line.as_bytes())
                         .and_then(|_| writer.write_all(b"\n"))
@@ -198,7 +203,10 @@ fn create_terminal(
                     break;
                 }
             };
-            if ok.is_err() { break; }
+                if ok.is_err() { break; }
+            }
+        } else {
+            eprintln!("[PTY ERROR] shell startup handshake failed or timed out");
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -222,6 +230,7 @@ fn create_terminal(
                             startup.clear();
                             ready = true;
                             eprintln!("[PTY READY] shell initialization completed");
+                            let _ = ready_tx.send(true);
                             tail
                         } else {
                             if startup.len() > 8192 {
@@ -238,7 +247,10 @@ fn create_terminal(
                 }
             }
         }
-        if !ready { eprintln!("[PTY ERROR] shell never became ready"); }
+        if !ready {
+            eprintln!("[PTY ERROR] shell never became ready");
+            let _ = ready_tx.send(false);
+        }
         let _ = end_tx.blocking_send(TerminalEvent::Exited);
     });
     tokio::spawn(pump_output(bot, owner, generation, sessions, session_id, out_rx));
@@ -521,11 +533,20 @@ mod tests {
         drop(pair.slave);
         writer.write_all(SHELL_INIT.as_bytes()).expect("initialize PTY");
         writer.flush().expect("flush init");
+        // Wait for the real ready marker before writing more input, as the
+        // production PTY controller now does.
+        let mut output = Vec::new();
+        let mut bytes = [0u8; 2048];
+        while !output.windows(SHELL_READY_MARKER.len())
+            .any(|w| w == SHELL_READY_MARKER.as_bytes()) {
+            let n = reader.read(&mut bytes).expect("read init");
+            assert!(n > 0, "shell stopped before ready handshake");
+            output.extend_from_slice(&bytes[..n]);
+        }
         writer.write_all(b"pwd\ncd /tmp\npwd\nprintf '100%%\\n'\nexit\n").expect("send");
         writer.flush().expect("flush commands");
         drop(writer);
         drop(pair.master);
-        let mut output = Vec::new();
         reader.read_to_end(&mut output).expect("read results");
         child.wait().expect("shell exit");
         let output = clean_terminal_output(&output);
