@@ -25,6 +25,12 @@ const MAX_OUTPUT_MESSAGE_CHARS: usize = 1550;
 const MAX_OUTPUT_MESSAGES_PER_MINUTE: usize = 80;
 const PROCESSED_ID_LIMIT: usize = 20_000;
 
+// Keep one shell process alive for persistent cwd/environment, but do not start
+// a terminal UI: that emits prompts and echoes DM commands back to the user.
+// The PTY remains attached, so Ctrl+C and programs requiring a TTY still work.
+// Commands are evaluated in order in the same shell process.
+const SHELL_DRIVER: &str = "stty -echo || exit 1; while IFS= read -r line; do eval \"$line\"; done";
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
@@ -148,7 +154,8 @@ fn create_terminal(
         .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("openpty failed: {e}"))?;
     let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-i");
+    cmd.arg("-c");
+    cmd.arg(SHELL_DRIVER);
     cmd.env("TERM", "dumb");
     cmd.env("PAGER", "cat");
     cmd.env("GIT_PAGER", "cat");
@@ -220,7 +227,11 @@ fn clean_terminal_output(input: &[u8]) -> String {
                 }
                 _ => {}
             }
-        } else if ch == '\r' { out.push('\n'); }
+        } else if ch == '\r' {
+            // PTYs commonly use CRLF. Render that as one newline, not two.
+            if it.peek() == Some(&'\n') { it.next(); }
+            out.push('\n');
+        }
         else if ch == '\n' || ch == '\t' || !ch.is_control() { out.push(ch); }
     }
     out
@@ -261,7 +272,10 @@ async fn pump_output(
         if window.elapsed() >= Duration::from_secs(60) {
             window = Instant::now(); sends_in_window = 0; notified_limit = false;
         }
-        let mut text = clean_terminal_output(&raw);
+        let cleaned = clean_terminal_output(&raw);
+        let mut text = cleaned.trim_matches('\n').to_string();
+        // Never emit empty "[CLI]" bubbles for startup/line-ending noise.
+        if text.trim().is_empty() && !exited { continue; }
         while !text.is_empty() {
             if sends_in_window >= MAX_OUTPUT_MESSAGES_PER_MINUTE {
                 if !notified_limit {
@@ -438,13 +452,46 @@ mod tests {
     }
     #[test]
     fn terminal_output_removes_ansi() {
-        assert_eq!(clean_terminal_output(b"abc\x1b[31mred\x1b[0m\r\n"), "abcred\n\n");
+        assert_eq!(clean_terminal_output(b"abc\x1b[31mred\x1b[0m\r\n"), "abcred\n");
+        // Do not strip actual program output just because it looks like a shell prompt.
+        assert_eq!(clean_terminal_output(b"100%\r\n"), "100%\n");
     }
     #[test]
     fn chunk_on_unicode_boundary() {
         let (a,b) = take_chars("日本語", 2);
         assert_eq!((a,b), ("日本", "語"));
     }
+    #[test]
+    fn quiet_shell_has_no_prompt_or_command_echo_and_keeps_cwd() {
+        // Use a readiness banner to avoid racing PTY initialization in CI.
+        // Production SHELL_DRIVER has no banner and never sends a prompt.
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
+        }).expect("open PTY");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg("stty -echo || exit 1; printf 'vector-ready\\n'; while IFS= read -r line; do eval \"$line\"; done");
+        let mut child = pair.slave.spawn_command(cmd).expect("launch quiet shell");
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut writer = pair.master.take_writer().expect("writer");
+        drop(pair.slave);
+        let mut startup = [0u8; 128];
+        let n = reader.read(&mut startup).expect("shell ready");
+        assert!(String::from_utf8_lossy(&startup[..n]).contains("vector-ready"));
+        writer.write_all(b"pwd\\ncd /tmp\\npwd\\nprintf '100%%\\n'\\nexit\\n").expect("write commands");
+        writer.flush().expect("flush commands");
+        drop(writer);
+        drop(pair.master);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read shell results");
+        child.wait().expect("wait for shell");
+        let result = clean_terminal_output(&output);
+        assert!(!result.contains("pwd"), "unexpected command echo: {result:?}");
+        assert!(!result.contains("lyla@"), "unexpected prompt: {result:?}");
+        assert!(result.contains("/tmp\\n"), "cwd did not persist: {result:?}");
+        assert!(result.contains("100%\\n"), "legitimate percent output lost: {result:?}");
+    }
+
     #[test]
     fn pty_can_start_local_shell() {
         let pair = native_pty_system().openpty(PtySize {
