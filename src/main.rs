@@ -468,7 +468,8 @@ mod tests {
         let pair = native_pty_system().openpty(PtySize {
             rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
         }).expect("open PTY");
-        let mut cmd = CommandBuilder::new("/bin/sh");
+        let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
+        let mut cmd = CommandBuilder::new(shell);
         cmd.arg("-c");
         cmd.arg("stty -echo || exit 1; printf 'vector-ready\\n'; while IFS= read -r line; do eval \"$line\"; done");
         let mut child = pair.slave.spawn_command(cmd).expect("launch quiet shell");
