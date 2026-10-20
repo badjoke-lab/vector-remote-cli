@@ -13,6 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/run-bot.sh
+          bash -n scripts/manage-mac.sh
+          bash -n scripts/update-and-start.sh
+          bash -n scripts/setup-mac.sh
+          bash -n 更新して起動.command
       - name: Check
         run: cargo check --all-targets
       - name: Unit tests
