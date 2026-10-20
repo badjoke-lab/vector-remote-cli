@@ -538,6 +538,62 @@ mod tests {
     }
 
     #[test]
+    fn persistent_shell_streams_results_without_closing_writer() {
+        // Regresses the macOS failure: RX handled "pwd" but no PTY data was
+        // returned. Unlike the batch test, no writer EOF or shell exit is
+        // involved before each response must arrive.
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
+        }).expect("open PTY");
+        let shell = if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" };
+        let mut cmd = CommandBuilder::new(shell);
+        if shell.ends_with("/zsh") { cmd.arg("-f"); }
+        cmd.arg("-i");
+        cmd.env("PS1", "");
+        cmd.env("PROMPT", "");
+        cmd.env("RPROMPT", "");
+        cmd.env("PROMPT_EOL_MARK", "");
+        let mut child = pair.slave.spawn_command(cmd).expect("launch interactive shell");
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let mut writer = pair.master.take_writer().expect("writer");
+        drop(pair.slave);
+        let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() { break; }
+            }
+        });
+
+        writer.write_all(SHELL_INIT.as_bytes()).expect("init");
+        writer.flush().expect("flush init");
+        let mut observed = String::new();
+        let receive_until = |observed: &mut String, marker: &str| {
+            for _ in 0..60 {
+                if observed.contains(marker) { return; }
+                let buf = rx.recv_timeout(Duration::from_millis(200))
+                    .expect("shell did not stream output before writer EOF");
+                observed.push_str(&String::from_utf8_lossy(&buf));
+            }
+            panic!("output marker not seen: {marker}");
+        };
+        receive_until(&mut observed, SHELL_READY_MARKER);
+        let at = observed.find(SHELL_READY_MARKER).expect("ready marker");
+        observed = observed[at + SHELL_READY_MARKER.len()..].to_string();
+
+        writer.write_all(b"printf 'vector-first-reply\\n'\n").expect("first command");
+        writer.flush().expect("first flush");
+        receive_until(&mut observed, "vector-first-reply");
+        writer.write_all(b"cd /tmp\npwd\n").expect("cwd commands");
+        writer.flush().expect("cwd flush");
+        receive_until(&mut observed, "/tmp");
+        assert!(!observed.contains("lyla@"), "interactive prompt leaked");
+        writer.write_all(b"exit\n").expect("exit");
+        writer.flush().expect("exit flush");
+        child.wait().expect("wait for shell");
+    }
+
+    #[test]
     fn pty_can_start_local_shell() {
         let pair = native_pty_system().openpty(PtySize {
             rows: 20, cols: 80, pixel_width: 0, pixel_height: 0,
